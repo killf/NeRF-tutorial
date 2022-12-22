@@ -1,12 +1,13 @@
 import torch
 import numpy as np
-from pytorch3d.renderer import ImplicitRenderer, NDCMultinomialRaysampler, MonteCarloRaysampler, EmissionAbsorptionRaymarcher, PerspectiveCameras
+import torch.nn.functional as F
+from pytorch3d.renderer import ImplicitRenderer, NDCMultinomialRaysampler, MonteCarloRaysampler, EmissionAbsorptionRaymarcher, PerspectiveCameras, ray_bundle_to_ray_points
 from tensorboardX import SummaryWriter
 import torchvision
 import datetime
 import os
 
-from model import NeuralRadianceField
+from model import DirectVoxGO
 from utils import *
 
 
@@ -21,9 +22,6 @@ class Solver:
         self.renderer_grid = ImplicitRenderer(raysampler=self.raysampler_grid, raymarcher=self.raymarcher)
         self.renderer_mc = ImplicitRenderer(raysampler=self.raysampler_mc, raymarcher=self.raymarcher)
 
-        self.neural_radiance_field = NeuralRadianceField().to(self.device)
-        self.optimizer = torch.optim.Adam(self.neural_radiance_field.parameters(), lr=5e-4)
-
         self.data = np.load("data/cow.npz")
         self.data_count = len(self.data["images"])
         self.batch_size = 8
@@ -32,6 +30,11 @@ class Solver:
         self.data_T = torch.from_numpy(self.data["T"]).to(self.device)
         self.data_images = torch.from_numpy(self.data["images"]).type(torch.float32) / 255
         self.data_silhouettes = torch.from_numpy(self.data["silhouette"]).unsqueeze(dim=-1)
+
+        xyz_min, xyz_max = self.compute_bbox_by_camera_frustum()
+
+        self.neural_radiance_field = DirectVoxGO(xyz_min, xyz_max).to(self.device)
+        self.optimizer = torch.optim.Adam(self.neural_radiance_field.parameters(), lr=5e-4)
 
         self.start_epoch = 1
         self.epochs = 2000
@@ -139,6 +142,26 @@ class Solver:
         if to_file:
             print(msg, end='\n', flush=True, file=open(self.log_file, "a+"))
 
+    @torch.no_grad()
+    def compute_bbox_by_camera_frustum(self):
+        indices, points, batch_size = torch.arange(self.data_count), [], 256
+        for i in range(0, self.data_count, batch_size):
+            batch_idx = indices[i:i + batch_size]
+            batch_cameras = PerspectiveCameras(R=self.data_R[batch_idx], T=self.data_T[batch_idx], focal_length=2., device=self.device)
+            batch_rays = self.raysampler_grid(batch_cameras)
+
+            min_points = batch_rays.origins + batch_rays.directions * self.raysampler_grid._min_depth
+            max_points = batch_rays.origins + batch_rays.directions * self.raysampler_grid._max_depth
+            batch_points = torch.stack([min_points, max_points], -2).reshape(-1, 3)
+            batch_points = torch.stack([batch_points.min(0).values, batch_points.max(0).values], 0)
+
+            points.append(batch_points)
+
+        points = torch.concatenate(points, dim=0)
+        xyz_min, xyz_max = points.min(0).values, points.max(0).values
+        return xyz_min, xyz_max
+
 
 if __name__ == '__main__':
-    Solver().train()
+    solver = Solver()
+    solver.train()
