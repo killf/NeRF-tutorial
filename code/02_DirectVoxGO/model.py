@@ -61,14 +61,22 @@ class DirectVoxGO(nn.Module):
         print('dvgo: voxel_size_base ', self.voxel_size_base)
         print('dvgo: voxel_size_ratio', self.voxel_size_ratio)
 
-    def _activate_density(self, density, interval):
+    def _activate_density(self, density, interval=1.):
+        """
+        alpha = 1 - exp(-softplus(density + shift) * interval)
+              = 1 - exp(-log(1 + exp(density + shift)) * interval)
+              = 1 - exp(log(1 + exp(density + shift)) ^ (-interval))
+              = 1 - (1 + exp(density + shift)) ^ (-interval)
+        """
         return 1 - (1 + torch.exp(density + self.act_shift)) ** (-interval)
 
     def forward(self, ray_bundle: RayBundle, **kwargs):
         rays_points_world = ray_bundle_to_ray_points(ray_bundle)
 
+        interval = torch.norm(ray_bundle.directions, p=2, dim=-1).unsqueeze(-1).unsqueeze(-1)
+
         density = self.density(rays_points_world)
-        density = self._activate_density(density, 0.5)
+        density = self._activate_density(density, interval)
 
         color = self.color(rays_points_world)
         color = torch.sigmoid(color)
