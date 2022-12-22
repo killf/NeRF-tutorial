@@ -39,7 +39,7 @@ class Solver:
         self.fine_optimizer = None
 
         self.start_epoch = 1
-        self.epochs = 2000
+        self.epochs = 100
         self.global_step = 0
         self.output_dir = "output"
         self.log_dir = os.path.join(self.output_dir, "log")
