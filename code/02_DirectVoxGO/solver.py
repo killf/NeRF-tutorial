@@ -34,7 +34,7 @@ class Solver:
         xyz_min, xyz_max = self.compute_bbox_by_camera_frustum()
 
         self.neural_radiance_field = DirectVoxGO(xyz_min, xyz_max).to(self.device)
-        self.optimizer = torch.optim.Adam(self.neural_radiance_field.parameters(), lr=5e-4)
+        self.optimizer = torch.optim.Adam(self.neural_radiance_field.parameters(), lr=5e-2)
 
         self.start_epoch = 1
         self.epochs = 2000
@@ -72,6 +72,7 @@ class Solver:
             color_loss = huber(rendered_images, colors_at_rays).abs().mean()
 
             loss = color_loss + sil_loss
+            # loss = color_loss
 
             self.optimizer.zero_grad()
             loss.backward()

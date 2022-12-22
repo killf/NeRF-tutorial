@@ -61,29 +61,21 @@ class DirectVoxGO(nn.Module):
         print('dvgo: voxel_size_base ', self.voxel_size_base)
         print('dvgo: voxel_size_ratio', self.voxel_size_ratio)
 
-    def _activate_density(self, density, interval=None):
-        # density = F.softplus(density, float(self.act_shift))
-        # if interval is not None:
-        #     density = density * interval
-        return 1 - (-density).exp()
+    def _activate_density(self, density, interval):
+        return 1 - (1 + torch.exp(density + self.act_shift)) ** (-interval)
 
     def forward(self, ray_bundle: RayBundle, **kwargs):
         rays_points_world = ray_bundle_to_ray_points(ray_bundle)
 
         density = self.density(rays_points_world)
-        density = self._activate_density(density, 0.1)
+        density = self._activate_density(density, 0.5)
 
         color = self.color(rays_points_world)
-        color = F.sigmoid(color)
+        color = torch.sigmoid(color)
 
         return density, color
 
-    def batched_forward(
-            self,
-            ray_bundle: RayBundle,
-            n_batches: int = 16,
-            **kwargs,
-    ):
+    def batched_forward(self, ray_bundle: RayBundle, n_batches: int = 16, **kwargs):
         """
         This function is used to allow for memory efficient processing
         of input rays. The input rays are first split to `n_batches`
