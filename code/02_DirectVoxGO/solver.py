@@ -32,9 +32,11 @@ class Solver:
         self.data_silhouettes = torch.from_numpy(self.data["silhouette"]).unsqueeze(dim=-1)
 
         xyz_min, xyz_max = self.compute_bbox_by_camera_frustum()
+        self.coarse_model = DirectVoxGO(xyz_min, xyz_max).to(self.device)
+        self.coarse_optimizer = torch.optim.Adam(self.coarse_model.parameters(), lr=5e-2)
 
-        self.neural_radiance_field = DirectVoxGO(xyz_min, xyz_max).to(self.device)
-        self.optimizer = torch.optim.Adam(self.neural_radiance_field.parameters(), lr=5e-2)
+        self.fine_model = None
+        self.fine_optimizer = None
 
         self.start_epoch = 1
         self.epochs = 2000
@@ -48,11 +50,22 @@ class Solver:
         self.load_checkpoint()
 
     def train(self):
+        for epoch in range(10):
+            self.train_epoch(epoch, self.coarse_model, self.coarse_optimizer)
+
+        xyz_min, xyz_max = self.compute_bbox_by_coarse_geo(self.coarse_model, 1e-3)
+        print('compute_bbox_by_coarse_geo: xyz_min', xyz_min)
+        print('compute_bbox_by_coarse_geo: xyz_max', xyz_max)
+
+        self.fine_model = DirectVoxGO(xyz_min, xyz_max, stage="fine").to(self.device)
+        self.fine_optimizer = torch.optim.Adam(self.fine_model.parameters(), lr=1e-3)
+
+        self.fine_model.density.copy_from(self.coarse_model.density)
         for epoch in range(self.start_epoch, self.epochs):
-            self.train_epoch(epoch)
+            self.train_epoch(epoch, self.fine_model, self.fine_optimizer)
             self.save_checkpoint(epoch)
 
-    def train_epoch(self, epoch):
+    def train_epoch(self, epoch, model, optimizer):
         t, c = Timer(), Counter()
         indices = torch.randperm(self.data_count)
         for i in range(0, self.data_count, self.batch_size):
@@ -62,7 +75,7 @@ class Solver:
             target_images = self.data_images[batch_idx].to(self.device)
             target_silhouettes = self.data_silhouettes[batch_idx].to(self.device)
 
-            rendered_images_silhouettes, sampled_rays = self.renderer_mc(cameras=batch_cameras, volumetric_function=self.neural_radiance_field)
+            rendered_images_silhouettes, sampled_rays = self.renderer_mc(cameras=batch_cameras, volumetric_function=model)
             rendered_images, rendered_silhouettes = rendered_images_silhouettes.split([3, 1], dim=-1)
 
             silhouettes_at_rays = sample_images_at_mc_locs(target_silhouettes, sampled_rays.xys)
@@ -72,11 +85,10 @@ class Solver:
             color_loss = huber(rendered_images, colors_at_rays).abs().mean()
 
             loss = color_loss + sil_loss
-            # loss = color_loss
 
-            self.optimizer.zero_grad()
+            optimizer.zero_grad()
             loss.backward()
-            self.optimizer.step()
+            optimizer.step()
 
             loss, sil_loss, color_loss = float(loss.cpu()), float(sil_loss.cpu()), float(color_loss.cpu())
             batch_time = t.elapsed_time()
@@ -100,7 +112,7 @@ class Solver:
                 with torch.no_grad():
                     with torch.no_grad():
                         camera = PerspectiveCameras(R=self.data_R[batch_idx][:1], T=self.data_T[batch_idx][:1], focal_length=2., device=self.device)
-                        rendered_image_silhouette, _ = self.renderer_grid(cameras=camera, volumetric_function=self.neural_radiance_field.batched_forward)
+                        rendered_image_silhouette, _ = self.renderer_grid(cameras=camera, volumetric_function=model.batched_forward)
                         rendered_image, rendered_silhouette = (rendered_image_silhouette[0].split([3, 1], dim=-1))
 
                     rendered_image = rendered_image.permute(2, 0, 1)
@@ -119,8 +131,10 @@ class Solver:
         state = {
             "epoch": epoch,
             "global_step": self.global_step,
-            "model": self.neural_radiance_field.state_dict(),
-            "optimizer": self.optimizer.state_dict()
+            "coarse_model": self.coarse_model.state_dict(),
+            "coarse_optimizer": self.coarse_optimizer.state_dict(),
+            "fine_model": self.fine_model.state_dict(),
+            "fine_optimizer": self.fine_optimizer.state_dict()
         }
 
         os.makedirs(self.output_dir, exist_ok=True)
@@ -135,8 +149,10 @@ class Solver:
         state = torch.load(file)
         self.start_epoch = state["epoch"] + 1
         self.global_step = state["global_step"]
-        self.neural_radiance_field.load_state_dict(state["model"])
-        self.optimizer.load_state_dict(state["optimizer"])
+        self.coarse_model.load_state_dict(state["coarse_model"])
+        self.coarse_optimizer.load_state_dict(state["coarse_optimizer"])
+        self.fine_model.load_state_dict(state["fine_model"])
+        self.fine_optimizer.load_state_dict(state["fine_optimizer"])
 
     def log(self, msg, end='\n', to_file=True):
         print(msg, end=end, flush=True)
@@ -160,6 +176,23 @@ class Solver:
 
         points = torch.concatenate(points, dim=0)
         xyz_min, xyz_max = points.min(0).values, points.max(0).values
+        return xyz_min, xyz_max
+
+    @torch.no_grad()
+    def compute_bbox_by_coarse_geo(self, model: DirectVoxGO, threshold):
+        interp = torch.stack(torch.meshgrid(
+            torch.linspace(0, 1, model.world_size[0], device=self.device),
+            torch.linspace(0, 1, model.world_size[1], device=self.device),
+            torch.linspace(0, 1, model.world_size[2], device=self.device),
+        ), -1)
+
+        dense_xyz = model.xyz_min * (1 - interp) + model.xyz_max * interp
+        density = model.density(dense_xyz)
+        alpha = model.activate_density(density)
+
+        active_xyz = dense_xyz[alpha.squeeze(-1) > threshold]
+        xyz_min, xyz_max = active_xyz.amin(0), active_xyz.amax(0)
+
         return xyz_min, xyz_max
 
 

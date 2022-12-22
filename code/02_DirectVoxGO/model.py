@@ -5,6 +5,47 @@ from pytorch3d.renderer import ray_bundle_to_ray_points, RayBundle
 import numpy as np
 
 
+class HarmonicEmbedding(torch.nn.Module):
+    def __init__(self, n_harmonic_functions=60, omega0=0.1):
+        """
+        Given an input tensor `x` of shape [minibatch, ... , dim],
+        the harmonic embedding layer converts each feature
+        in `x` into a series of harmonic features `embedding`
+        as follows:
+            embedding[..., i*dim:(i+1)*dim] = [
+                sin(x[..., i]),
+                sin(2*x[..., i]),
+                sin(4*x[..., i]),
+                ...
+                sin(2**(self.n_harmonic_functions-1) * x[..., i]),
+                cos(x[..., i]),
+                cos(2*x[..., i]),
+                cos(4*x[..., i]),
+                ...
+                cos(2**(self.n_harmonic_functions-1) * x[..., i])
+            ]
+
+        Note that `x` is also premultiplied by `omega0` before
+        evaluating the harmonic functions.
+        """
+        super().__init__()
+        self.register_buffer(
+            'frequencies',
+            omega0 * (2.0 ** torch.arange(n_harmonic_functions)),
+        )
+
+    def forward(self, x):
+        """
+        Args:
+            x: tensor of shape [..., dim]
+        Returns:
+            embedding: a harmonic embedding of `x`
+                of shape [..., n_harmonic_functions * dim * 2]
+        """
+        embed = (x[..., None] * self.frequencies).view(*x.shape[:-1], -1)
+        return torch.cat((embed.sin(), embed.cos()), dim=-1)
+
+
 class DenseGrid(nn.Module):
     def __init__(self, channels, world_size, xyz_min, xyz_max):
         super(DenseGrid, self).__init__()
@@ -28,9 +69,22 @@ class DenseGrid(nn.Module):
         out = out.reshape(self.channels, -1).T.reshape(*shape, self.channels)
         return out
 
+    @torch.no_grad()
+    def copy_from(self, other):
+        interp = torch.stack(torch.meshgrid(
+            torch.linspace(0, 1, self.world_size[0], device=self.grid.device),
+            torch.linspace(0, 1, self.world_size[1], device=self.grid.device),
+            torch.linspace(0, 1, self.world_size[2], device=self.grid.device),
+        ), -1)
+
+        dense_xyz = self.xyz_min * (1 - interp) + self.xyz_max * interp
+        values = other(dense_xyz)
+        values = values.permute(3, 2, 1, 0).unsqueeze(0)
+        self.grid.data[:] = values
+
 
 class DirectVoxGO(nn.Module):
-    def __init__(self, xyz_min, xyz_max, num_voxels=1024000, num_voxels_base=1024000, alpha_init=1e-6, fast_color_threshold=1e-7):
+    def __init__(self, xyz_min, xyz_max, num_voxels=1024000, num_voxels_base=1024000, alpha_init=1e-6, fast_color_threshold=1e-7, stage="coarse"):
         super().__init__()
 
         self.register_buffer('xyz_min', torch.Tensor(xyz_min))
@@ -47,8 +101,18 @@ class DirectVoxGO(nn.Module):
         self._set_grid_resolution(num_voxels)
 
         self.density = DenseGrid(1, self.world_size, self.xyz_min, self.xyz_max)
-        self.color = DenseGrid(3, self.world_size, self.xyz_min, self.xyz_max)
-        self.color_net = None
+        if stage == "coarse":
+            self.color = DenseGrid(3, self.world_size, self.xyz_min, self.xyz_max)
+            self.color_net = None
+        else:
+            self.color = DenseGrid(12, self.world_size, self.xyz_min, self.xyz_max)
+            self.color_net = nn.Sequential(
+                nn.Linear(12 + 27, 128), nn.ReLU(inplace=True),
+                nn.Linear(128, 128), nn.ReLU(inplace=True),
+                nn.Linear(128, 3)
+            )
+            nn.init.constant_(self.color_net[-1].bias, 0)
+            self.register_buffer('view_frequencies', torch.FloatTensor([(2 ** i) for i in range(4)]))
 
     def _set_grid_resolution(self, num_voxels):
         # Determine grid resolution
@@ -61,7 +125,7 @@ class DirectVoxGO(nn.Module):
         print('dvgo: voxel_size_base ', self.voxel_size_base)
         print('dvgo: voxel_size_ratio', self.voxel_size_ratio)
 
-    def _activate_density(self, density, interval=1.):
+    def activate_density(self, density, interval=1.):
         """
         alpha = 1 - exp(-softplus(density + shift) * interval)
               = 1 - exp(-log(1 + exp(density + shift)) * interval)
@@ -76,10 +140,21 @@ class DirectVoxGO(nn.Module):
         interval = torch.norm(ray_bundle.directions, p=2, dim=-1).unsqueeze(-1).unsqueeze(-1)
 
         density = self.density(rays_points_world)
-        density = self._activate_density(density, interval)
+        density = self.activate_density(density, interval)
 
         color = self.color(rays_points_world)
-        color = torch.sigmoid(color)
+        if self.color_net is None:
+            color = torch.sigmoid(color)
+        else:
+            view_directions_emb = (ray_bundle.directions.unsqueeze(-1) * self.view_frequencies).flatten(-2)
+            view_directions_emb = torch.cat([ray_bundle.directions, view_directions_emb.sin(), view_directions_emb.cos()], -1)
+            if view_directions_emb.ndim == 2:
+                view_directions_emb = view_directions_emb.unsqueeze(-2).repeat(1, color.shape[-2], 1)
+            elif view_directions_emb.ndim == 3:
+                view_directions_emb = view_directions_emb.unsqueeze(-2).repeat(1, 1, color.shape[-2], 1)
+            color = torch.cat([color, view_directions_emb], -1)
+            color = self.color_net(color)
+            color = torch.sigmoid(color)
 
         return density, color
 
